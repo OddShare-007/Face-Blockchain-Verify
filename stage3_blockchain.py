@@ -8,6 +8,7 @@ import os
 import json
 import sys
 import hashlib
+import re
 from typing import Optional, Dict
 from datetime import datetime
 
@@ -88,6 +89,9 @@ def write_to_blockchain(matched_post_json_path: str, contract_address: str, outp
     
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, "transaction_record.json")
+    if os.path.isfile(output_file):
+        os.remove(output_file)
     
     # Validate input file
     if not os.path.isfile(matched_post_json_path):
@@ -130,6 +134,11 @@ def write_to_blockchain(matched_post_json_path: str, contract_address: str, outp
     # Clean up private key (remove 0x prefix if present)
     if private_key.startswith("0x"):
         private_key = private_key[2:]
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", private_key):
+        raise ValueError(
+            "PRIVATE_KEY is invalid. It must be a 64-character hexadecimal "
+            "Sepolia wallet private key."
+        )
     
     try:
         # Connect to Sepolia testnet
@@ -145,7 +154,18 @@ def write_to_blockchain(matched_post_json_path: str, contract_address: str, outp
         
         # Validate contract address
         contract_address = Web3.to_checksum_address(contract_address)
+        if contract_address == account.address:
+            raise ValueError(
+                "VERIFIER_CONTRACT_ADDRESS matches the signing wallet address. "
+                "Set it to the actual deployed Verifier contract address."
+            )
         print(f"  → Target contract: {contract_address}")
+
+        if not web3.eth.get_code(contract_address):
+            raise ValueError(
+                "VERIFIER_CONTRACT_ADDRESS has no deployed contract code on Sepolia. "
+                "Deploy contracts/Verifier.sol and use its address."
+            )
         
         # Create contract instance
         contract = web3.eth.contract(
@@ -158,16 +178,19 @@ def write_to_blockchain(matched_post_json_path: str, contract_address: str, outp
         transaction = contract.functions.storeRecord(data_hash).build_transaction({
             "from": account.address,
             "nonce": web3.eth.get_transaction_count(account.address),
-            "gas": 100000,  # Estimate for storeRecord
+            "chainId": web3.eth.chain_id,
             "gasPrice": web3.eth.gas_price,
         })
+        estimated_gas = web3.eth.estimate_gas(transaction)
+        transaction["gas"] = estimated_gas + (estimated_gas // 5)
+        print(f"  → Estimated gas: {estimated_gas}; using limit: {transaction['gas']}")
         
         # Sign transaction
         signed_txn = web3.eth.account.sign_transaction(transaction, private_key)
         
         # Send transaction
         print(f"  → Sending transaction...")
-        tx_hash = web3.eth.send_raw_transaction(signed_txn.rawTransaction)
+        tx_hash = web3.eth.send_raw_transaction(signed_txn.raw_transaction)
         tx_hash_hex = tx_hash.hex()
         
         print(f"  ✓ Transaction sent: {tx_hash_hex}")
@@ -175,7 +198,7 @@ def write_to_blockchain(matched_post_json_path: str, contract_address: str, outp
         
         # Wait for transaction receipt (up to 60 seconds)
         try:
-            receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
         except Exception as e:
             print(f"  ⚠ Timeout waiting for receipt (transaction may still be pending): {e}")
             receipt = None
@@ -195,13 +218,17 @@ def write_to_blockchain(matched_post_json_path: str, contract_address: str, outp
             result["block_number"] = receipt["blockNumber"]
             result["gas_used"] = receipt["gasUsed"]
             result["status"] = "confirmed" if receipt["status"] == 1 else "failed"
+            if receipt["status"] != 1:
+                raise RuntimeError(
+                    f"Blockchain transaction reverted in block {receipt['blockNumber']}; "
+                    "check the contract address and transaction details."
+                )
             print(f"  ✓ Transaction confirmed in block {receipt['blockNumber']}")
         else:
             result["status"] = "pending"
             print(f"  ⚠ Transaction pending (may take a few minutes)")
         
         # Save transaction details to output file
-        output_file = os.path.join(output_dir, "transaction_record.json")
         with open(output_file, "w") as f:
             json.dump(result, f, indent=2)
         
@@ -218,12 +245,14 @@ def write_to_blockchain(matched_post_json_path: str, contract_address: str, outp
         raise
 
 
-def main(matched_post_path: str = "output/matched_post.json", contract_address: str = None):
+def main(matched_post_path: str = "output/matched_post.json", contract_address: Optional[str] = None):
     """Main entry point for stage 3"""
     
     # Get contract address from environment or parameter
     if not contract_address:
-        contract_address = os.getenv("VERIFIER_CONTRACT_ADDRESS")
+        configured_contract_address = os.getenv("VERIFIER_CONTRACT_ADDRESS")
+        if configured_contract_address:
+            contract_address = configured_contract_address
     
     if not contract_address:
         print("\n[Stage 3] ✗ FAILED: VERIFIER_CONTRACT_ADDRESS not set in environment\n")
@@ -232,7 +261,10 @@ def main(matched_post_path: str = "output/matched_post.json", contract_address: 
     
     try:
         result = write_to_blockchain(matched_post_path, contract_address)
-        print("\n[Stage 3] ✓ SUCCESS: Hash written to blockchain\n")
+        if result and result.get("status") == "confirmed":
+            print("\n[Stage 3] ✓ SUCCESS: Hash written to blockchain\n")
+        else:
+            print("\n[Stage 3] ⚠ PENDING: Waiting for blockchain confirmation\n")
         return result
     except FileNotFoundError as e:
         print(f"\n[Stage 3] ✗ FAILED: {e}\n")

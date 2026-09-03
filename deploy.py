@@ -5,8 +5,9 @@ import os
 import re
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
-from solcx import compile_source, install_solc, set_solc_version
+from solcx import compile_source, get_installed_solc_versions, install_solc, set_solc_version
 from web3 import Web3
 
 
@@ -40,7 +41,14 @@ def main() -> None:
     print(f"Deploying from: {account.address}")
     print(f"Network chain ID: {web3.eth.chain_id}")
 
-    install_solc(SOLC_VERSION)
+    if SOLC_VERSION not in {str(version) for version in get_installed_solc_versions()}:
+        try:
+            install_solc(SOLC_VERSION)
+        except requests.exceptions.RequestException as e:
+            raise ConnectionError(
+                "Could not download Solidity compiler from solc-bin.ethereum.org. "
+                "Check DNS/internet access, or deploy contracts/Verifier.sol with Remix."
+            ) from e
     set_solc_version(SOLC_VERSION)
     source = CONTRACT_PATH.read_text(encoding="utf-8")
     compiled = compile_source(
@@ -65,20 +73,20 @@ def main() -> None:
     )
     transaction["gas"] = web3.eth.estimate_gas(transaction)
     signed = web3.eth.account.sign_transaction(transaction, private_key)
-    transaction_hash = web3.eth.send_raw_transaction(signed.rawTransaction)
+    transaction_hash = web3.eth.send_raw_transaction(signed.raw_transaction)
     print(f"Transaction: {transaction_hash.hex()}")
     receipt = web3.eth.wait_for_transaction_receipt(transaction_hash, timeout=120)
 
     result = {
-        "contract_address": receipt.contractAddress,
+        "contract_address": receipt["contractAddress"],
         "deployer_address": account.address,
         "transaction_hash": transaction_hash.hex(),
         "chain_id": web3.eth.chain_id,
-        "etherscan_link": f"https://sepolia.etherscan.io/address/{receipt.contractAddress}",
+        "etherscan_link": f"https://sepolia.etherscan.io/address/{receipt['contractAddress']}",
     }
     OUTPUT_PATH.parent.mkdir(exist_ok=True)
     OUTPUT_PATH.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(f"Contract: {receipt.contractAddress}")
+    print(f"Contract: {receipt['contractAddress']}")
     print(f"Saved deployment details to: {OUTPUT_PATH.relative_to(PROJECT_ROOT)}")
     print("Set VERIFIER_CONTRACT_ADDRESS in .env to the contract address above.")
 

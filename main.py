@@ -105,7 +105,7 @@ def main():
         print("⚠ Stage 2 returned no results.")
         print("  This means the image was not found in SerpApi's reverse image search.")
         print("  Try using a face photo that's already posted on social media.\n")
-        print("  Continuing to Stage 3 anyway...\n")
+        print("  Stage 3 will not run without output/matched_post.json.\n")
     
     # ============================================================================
     # STAGE 3: BLOCKCHAIN VERIFICATION (Conditional)
@@ -117,6 +117,12 @@ def main():
     elif args.use_local_chain:
         print_header("[3/4] STAGE 3: Blockchain Verification (LOCAL CHAIN)")
         print("Using local SQLite hash chain instead of Ethereum\n")
+
+        if not os.path.isfile("output/matched_post.json"):
+            print("✗ Stage 3 blocked: output/matched_post.json does not exist.\n")
+            stage3_result = None
+            verification_result = False
+            return False
         
         try:
             import local_chain
@@ -153,6 +159,12 @@ def main():
             stage3_result = None
     else:
         print_header("[3/4] STAGE 3: Blockchain Verification")
+
+        if not os.path.isfile("output/matched_post.json"):
+            print("⚠ Stage 3 blocked: output/matched_post.json does not exist.\n")
+            stage3_result = None
+            verification_result = False
+            return False
         
         # Get contract address
         contract_address = args.contract or os.getenv("VERIFIER_CONTRACT_ADDRESS")

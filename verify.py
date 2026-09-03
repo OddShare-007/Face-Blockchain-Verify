@@ -7,6 +7,7 @@ import os
 import json
 import sys
 import hashlib
+from dotenv import load_dotenv
 from typing import Optional, Dict
 
 try:
@@ -51,7 +52,7 @@ def compute_data_hash(matched_post_data: dict) -> str:
 def verify_on_chain(
     transaction_record_path: str = "output/transaction_record.json",
     matched_post_path: str = "output/matched_post.json",
-    contract_address: str = None
+    contract_address: Optional[str] = None
 ) -> Optional[Dict]:
     """
     Verifies that the on-chain record matches the local data.
@@ -66,12 +67,13 @@ def verify_on_chain(
     """
     
     print("[Verify] Starting verification process...")
+    load_dotenv()
     
     # Load transaction record
     if not os.path.isfile(transaction_record_path):
         print(f"  ⚠ Transaction record not found: {transaction_record_path}")
-        print("  → Attempting verification from environment/fallback...")
-        transaction_record = {}
+        print("  ✗ Cannot verify without a real blockchain transaction")
+        return None
     else:
         try:
             with open(transaction_record_path, "r") as f:
@@ -94,27 +96,57 @@ def verify_on_chain(
         print(f"  ERROR: Failed to parse matched post: {e}")
         return None
     
-    # Re-compute hash locally
-    if not matched_post or "url" not in matched_post:
-        print("  ⚠ No valid matched post data")
-        local_hash = hashlib.sha256(b"").hexdigest()
-    else:
-        local_hash = compute_data_hash(matched_post)
+    required_fields = ("url", "title", "source")
+    if not all(matched_post.get(field) for field in required_fields):
+        print("  ERROR: matched_post.json is missing url, title, or source")
+        return None
+    local_hash = compute_data_hash(matched_post)
     
     print(f"  → Local hash: {local_hash}")
     
-    # Try to get on-chain hash
+    # A transaction record must contain the hash written by Stage 3.
     on_chain_hash = transaction_record.get("data_hash")
-    
     if not on_chain_hash:
-        print("  ⚠ No on-chain hash in transaction record")
-        print("  → Using local hash only")
-        on_chain_hash = local_hash
-    else:
-        print(f"  → On-chain hash: {on_chain_hash}")
+        print("  ERROR: Transaction record contains no blockchain hash")
+        return None
+    if transaction_record.get("status") != "confirmed":
+        print("  ERROR: Blockchain transaction is not confirmed")
+        return None
+    print(f"  → Transaction-record hash: {on_chain_hash}")
+
+    rpc_url = os.getenv("SEPOLIA_RPC_URL")
+    address = transaction_record.get("contract_address") or contract_address
+    if not rpc_url or not address:
+        print("  ERROR: SEPOLIA_RPC_URL and contract address are required")
+        return None
+    web3 = Web3(Web3.HTTPProvider(rpc_url))
+    if not web3.is_connected():
+        print("  ERROR: Could not connect to Sepolia RPC")
+        return None
+    transaction_hash = transaction_record.get("transaction_hash")
+    if not transaction_hash:
+        print("  ERROR: Transaction record contains no transaction hash")
+        return None
+    try:
+        receipt = web3.eth.get_transaction_receipt(transaction_hash)
+    except Exception as e:
+        print(f"  ERROR: Could not read transaction receipt from Sepolia: {e}")
+        return None
+    if receipt["status"] != 1:
+        print("  ERROR: Recorded blockchain transaction failed")
+        return None
+    if receipt["to"] and Web3.to_checksum_address(receipt["to"]) != Web3.to_checksum_address(address):
+        print("  ERROR: Transaction target does not match the recorded contract")
+        return None
+    contract = web3.eth.contract(
+        address=Web3.to_checksum_address(address),
+        abi=VERIFIER_ABI,
+    )
+    _, chain_hash, _ = contract.functions.getLatestRecord().call()
+    print(f"  → Latest contract hash: {chain_hash}")
     
     # Compare hashes
-    if local_hash == on_chain_hash:
+    if local_hash == on_chain_hash == chain_hash:
         print("\n[Verify] ✓✓✓ MATCH: VERIFIED ✓✓✓")
         status = "VERIFIED"
         match = True
@@ -141,7 +173,7 @@ def verify_on_chain(
 def main():
     """Main entry point for verification"""
     
-    contract_address = os.getenv("VERIFIER_CONTRACT_ADDRESS")
+    contract_address: Optional[str] = os.getenv("VERIFIER_CONTRACT_ADDRESS")
     
     try:
         result = verify_on_chain(contract_address=contract_address)
